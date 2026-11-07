@@ -1,0 +1,22 @@
+#!/bin/sh
+#
+# 开机启动 AP 推流模式。
+#
+# 只在选了 BR2_PACKAGE_APFPV 的镜像里有这个脚本 —— 也就是 apfpv 变体，
+# FPV（wfb-ng）那份镜像不含它。
+#
+case "$1" in
+	start)
+		/usr/bin/apfpv start
+		;;
+	stop)
+		/usr/bin/apfpv stop
+		;;
+	restart|reload)
+		/usr/bin/apfpv restart
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart}" >&2
+		exit 1
+		;;
+esac

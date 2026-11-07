@@ -1,0 +1,23 @@
+config BR2_PACKAGE_APFPV
+	bool "apfpv"
+	depends on BR2_USE_MMU # hostapd fork()s
+	select BR2_PACKAGE_RTW_HOSTAPD
+	select BR2_PACKAGE_RTW_HOSTAPD_DRIVER_NL80211
+	select BR2_PACKAGE_RTW_HOSTAPD_DRIVER_RTW
+	select BR2_PACKAGE_IW
+	help
+	  Pure access-point streaming: the USB Wi-Fi card becomes a plain
+	  hotspot and clients (goggles, phones, tablets) pull the video over
+	  RTSP or the web UI. No wfb-ng, therefore no link keys and no
+	  matching ground-side firmware.
+
+	  把 USB 无线网卡做成普通 WiFi 热点，眼镜/手机连上来用 RTSP 或网页
+	  取图传。不使用 wfb-ng，所以不需要密钥，也不需要配套的地面端固件。
+
+	  The DHCP server comes from BusyBox (CONFIG_UDHCPD, enabled in this
+	  tree's busybox.config), so nothing else has to be selected for it.
+
+	  hostapd's tweakable knobs (WPA3, EAP, WPS, VLAN) are left at their
+	  defaults: WPA2-PSK needs none of them, and leaving them off keeps
+	  OpenSSL out of the image -- rtw-hostapd falls back to CONFIG_TLS=internal
+	  when BR2_PACKAGE_LIBOPENSSL is not selected.

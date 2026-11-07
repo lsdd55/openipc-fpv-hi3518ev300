@@ -1,0 +1,18 @@
+# 换行符统一为 LF。
+#
+# 为什么必须显式规定：工程在 Windows 上编辑、在 WSL/CI 的 Linux 上构建。
+# 若 Windows 侧 core.autocrlf=true，checkout 会把 *.sh 变成 CRLF，
+# 到了 Linux 上首行变成 "#!/bin/sh\r"，执行时报
+#   /bin/sh: bad interpreter: No such file or directory
+# —— 而这个报错完全看不出是换行符问题。
+* text=auto eol=lf
+
+# 密钥是 64 字节裸二进制，不能被当文本处理（转换会直接毁掉密钥）
+*.key binary
+keys/gs.key binary
+
+# 二进制产物
+*.bin binary
+*.tgz binary
+*.ko binary
+*.so binary

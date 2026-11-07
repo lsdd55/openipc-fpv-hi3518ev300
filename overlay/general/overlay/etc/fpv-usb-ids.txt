@@ -1,0 +1,42 @@
+# 本镜像内置的 USB 无线网卡驱动与 VID:PID 对照表
+#
+# 排障用：  wifibroadcast detect      —— 打印当前插入网卡被识别成哪个驱动
+#           lsusb                     —— 看原始 ID
+#
+# 注意 Hi3518EV300 只有一个 USB 2.0 主机口（DWC3 控制器 + 2.0 PHY），
+# 同时插多张卡需要外供电 HUB，且总带宽被 USB2.0 的 ~480Mbps 物理上限
+# 以及 wfb 注入路径共同限制，实测约 20~25Mbps 可用。
+
+[RTL8812AU / RTL8811AU]  ->  88XXau.ko   (openipc/realtek-wlan rtl8812au_fpv)
+  0bda:8812   0bda:881a   0b05:17d2   2357:0101   2604:0012
+
+[不支持的卡 RTL8814AU]    ->  本固件不含此驱动
+  0bda:8813   0b05:1817   0b05:1852   0b05:1853
+  056e:400b   056e:400d   7392:a833   7392:a834
+  0e66:0026   2357:0106   20f4:809a   20f4:809b
+  0846:9054   2001:331a
+
+[不支持的卡 RTL8812CU / RTL8822CU]  ->  本固件不含此驱动
+  0bda:c812   0bda:c82c   0bda:c82e
+  0bda:d820   0bda:d82b   13b1:0043
+
+[RTL8733BU]              ->  8733bu.ko   (openipc/realtek-wlan rtl8733bu_fpv)
+  0bda:f72b   0bda:b733
+
+[不支持] MT7921AU
+  唯一驱动是 mt76/mt7921u，要求内核 >= 6.12；本平台内核为 4.9.37。
+  详见 /docs/网卡与传感器兼容性.md
+
+[不支持] RTL8812EU  (0bda:a81a)
+  上游 wifibroadcast 脚本认识这张卡（driver=8812eu），但你这次只要了
+  四张卡，镜像里没有编 rtl8812eu 驱动，所以这张卡插上会报"未识别"。
+  需要的话在 defconfig 里加 BR2_PACKAGE_RTL8812EU_OPENIPC=y，
+  再在 /usr/bin/wifibroadcast 的 driver_of_pid 里补 0bda:a81a -> 8812eu。
+
+------------------------------------------------------------------------------
+如果你的网卡不在此表：用 lsusb 拿到 VID:PID 后，先试同芯片家族那一条。
+四个模块全在镜像里，wifibroadcast 只按 PID 装一个，可以安全地手工验证：
+
+    rmmod 8812au 88XXau 8733bu 2>/dev/null
+    modprobe 8733bu
+    ip link            # 看 wlan* 有没有出来

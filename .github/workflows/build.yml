@@ -1,0 +1,389 @@
+name: build-fpv-hi3518ev300
+
+# 触发方式：
+#   1. 手动  Actions -> build-fpv-hi3518ev300 -> Run workflow
+#   2. push 到 main/master 且改动了构建相关文件
+#
+# 一次跑出两个产物（matrix）：
+#   hi3518ev300_fpv_wfbng  wfb-ng 空中端（drone.key）
+#   hi3518ev300_apfpv      纯 AP 推流（热点 + RTSP，不要密钥）
+# 两个 job 并行，各自的下载缓存键相同（工具链/内核共用），
+# 所以只有一个会成功写入缓存，另一个只读 —— 无害。
+#
+# 不需要任何 Personal Access Token：只读本仓库、克隆公开的上游仓库、
+# 上传 artifact 时用的是 GitHub 自动注入的 GITHUB_TOKEN。
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_sha:
+        description: 'OpenIPC/firmware 提交（留空用固定值）'
+        required: false
+        default: '9f0639eb9f5ad7cdc4380135cbcf658f345038f6'
+  push:
+    branches: [main, master]
+    paths:
+      - 'overlay/**'
+      - 'scripts/**'
+      - 'keys/**'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/OpenIPC/firmware
+  PINNED_SHA: 9f0639eb9f5ad7cdc4380135cbcf658f345038f6
+
+jobs:
+  build:
+    name: build ${{ matrix.board }}
+    # 固定 24.04：24.04 的宿主 gcc 是 13，与 Buildroot 2024.02 兼容。
+    # ubuntu-latest 将来会漂到更新的发行版，宿主 gcc 太新会让
+    # Buildroot 的老 host 包 configure 失败。
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      # 一个板失败不要连累另一个：两份镜像彼此独立，
+      # FPV 那份绿了就能刷，AP 那份失败单独看即可。
+      fail-fast: false
+      matrix:
+        board:
+          - hi3518ev300_fpv_wfbng
+          - hi3518ev300_apfpv
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 释放磁盘空间
+        # runner 默认约 14GB 可用；海思工具链 + Buildroot 输出要 12~15GB。
+        run: |
+          set -x
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 安装宿主依赖
+        run: |
+          sudo apt-get update
+          # bison/flex/perl/bzip2/xz-utils/gettext/gawk/patch 都是 Buildroot
+          # 的必需项（见 support/dependencies/dependencies.sh）。漏了它们，
+          # 往往不是立刻报错，而是编到某个下游包才挂 —— 补全更省时间。
+          sudo apt-get install -y --no-install-recommends \
+            automake autotools-dev bc bison build-essential bzip2 cpio curl \
+            file flex fzf gawk gettext git libncurses-dev libtool lzop make \
+            patch perl rsync unzip wget libssl-dev xz-utils \
+            python3 python3-pip
+          python3 -m pip install --user --break-system-packages kconfiglib
+
+      - name: 取上游并检出固定提交
+        env:
+          SHA: ${{ inputs.upstream_sha || env.PINNED_SHA }}
+        run: |
+          set -euo pipefail
+          git clone "$UPSTREAM_REPO" work/firmware
+          cd work/firmware
+          git fetch --depth 1 origin "$SHA"
+          git checkout "$SHA"
+          echo "upstream=$(git rev-parse HEAD)" | tee -a "$GITHUB_ENV"
+
+      - name: 校验密钥文件一致性
+        # 镜像里的 drone.key 必须与 keys/drone.key 完全一致，
+        # 否则地面端拿着 keys/gs.key 会收不到图。
+        run: |
+          set -euo pipefail
+          cmp keys/drone.key overlay/general/package/wifibroadcast-ng/files/drone.key
+          sz=$(stat -c %s keys/drone.key)
+          [ "$sz" -eq 64 ] || { echo "drone.key 应为 64 字节，实际 $sz"; exit 1; }
+
+          # 注意：这里**不能**检查 keys/gs.key 的大小。
+          # gs.key 是地面端的私钥，被 .gitignore 排除，仓库里根本没有这个文件；
+          # 以前这里写了 stat keys/gs.key，配 set -e 必然让整个 job 在第 6 步就挂掉。
+          # 反过来断言它确实不在仓库里 —— 万一哪天被误提交，这一步会立刻报警。
+          if [ -e keys/gs.key ]; then
+            echo "keys/gs.key 出现在仓库里 —— 地面端私钥绝不能入库，请检查 .gitignore"
+            exit 1
+          fi
+
+          echo "密钥文件 OK（drone.key 64 字节且与镜像内一致，gs.key 不在仓库里）"
+          grep -E 'fp ' keys/PUBKEYS.txt
+
+      - name: 铺 overlay 到上游树
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/apply-overlay.sh work/firmware
+
+      # 下载缓存。构建需要拉 98.5 MB 的预编译工具链、上百 MB 的内核源码，
+      # 以及几十个包。第一次跑完就存起来，之后任何一次重试（比如某个驱动
+      # 编译失败改完重跑）都直接命中，省掉十几分钟下载。
+      #
+      # 用 BR2_DL_DIR 指定到独立目录（上游 Makefile 的 prepare 目标会读它），
+      # 而不是默认的 output/buildroot-*/dl —— 后者藏在被重新解包的上游树里，
+      # 缓存路径不稳定。
+      #
+      # restore-keys 用前缀匹配：upstream_sha 变了（换了上游提交）就只复用
+      # 公共部分，避免用到不匹配的旧源码。
+      - name: 恢复下载缓存
+        uses: actions/cache@v4
+        with:
+          path: work/dl
+          key: br-dl-${{ env.PINNED_SHA }}-${{ hashFiles('overlay/**', 'scripts/**') }}
+          restore-keys: |
+            br-dl-${{ env.PINNED_SHA }}-
+            br-dl-
+
+      - name: 构建
+        env:
+          BOARD: ${{ matrix.board }}
+        run: |
+          set -o pipefail
+          cd work/firmware
+          # BR2_DL_DIR 会被传给内层 Buildroot 的 make（命令行赋值经由
+          # MAKEFLAGS 自动继承），上游 prepare 目标的缓存清理也认这个变量。
+          make BOARD="$BOARD" BR2_DL_DIR="$GITHUB_WORKSPACE/work/dl" \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+      - name: 失败诊断
+        # 构建失败时自动从日志里抽出是哪个包挂了，并给出对应的下一步。
+        # 这样不用把几十万行日志从头翻。
+        if: failure()
+        run: |
+          set +e
+          echo "===== 最后一个失败的 Buildroot 包 ====="
+          # Buildroot 失败时会留下 ".../build/<pkg>-<ver>/.stamp_*_failed" 标记
+          found=$(find work/firmware/output/build -maxdepth 2 -name '.*_failed' 2>/dev/null | head -20)
+          echo "${found:-（没有找到 .stamp_*_failed 标记）}"
+
+          echo
+          echo "===== 日志里的关键错误行 ====="
+          grep -nE 'Error [0-9]|error:|No such file|undefined reference|cannot find|fatal error|Unknown Kconfig|has no installation candidate' \
+            build.log 2>/dev/null | tail -40
+
+          {
+            echo "### 失败诊断"
+            echo ""
+            echo "**失败的包**"
+            echo '```'
+            echo "${found:-unknown}"
+            echo '```'
+            echo ""
+            echo "**相关文档**：新增驱动包换源方案见 \`docs/网卡与传感器兼容性.md\` §1.2 / §1.3"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 缓存用量报告
+        if: always()
+        run: |
+          echo "=== 下载缓存 ==="
+          if [ -d work/dl ]; then
+            du -sh work/dl
+            echo "文件数: $(find work/dl -maxdepth 2 -type f | wc -l)"
+            echo
+            echo "最大的 10 个:"
+            find work/dl -maxdepth 2 -type f -printf '%s %p\n' 2>/dev/null \
+              | sort -rn | head -10 | awk '{printf "  %.1f MB  %s\n", $1/1048576, $2}'
+          else
+            echo "（缓存目录不存在）"
+          fi
+          {
+            echo "### 下载缓存"
+            echo '```'
+            du -sh work/dl 2>/dev/null || echo "none"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 记录实际使用的源码版本
+        # 这个镜像里有若干包**版本是浮动的**（见下面注释），所以"完全可复现"
+        # 做不到。能做的是：把这次实际下载到的每个文件的 SHA-256 记下来，
+        # 以后重建时可以与它比对，也能据此把浮动项固定成具体提交。
+        if: always()
+        run: |
+          set +e
+          OUT=source-manifest.txt
+          {
+            echo "# 本次构建实际使用的源码"
+            echo
+            echo "生成时间（UTC）: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo
+            echo "## 下载缓存里每个文件的 SHA-256"
+            echo
+            echo '```'
+            if [ -d work/dl ]; then
+              find work/dl -maxdepth 2 -type f -print0 2>/dev/null \
+                | sort -z | xargs -0 -r sha256sum 2>/dev/null \
+                | sed 's|work/dl/||'
+            else
+              echo "(work/dl 不存在)"
+            fi
+            echo '```'
+            echo
+            echo "## 版本浮动的包（重建可能拿到不同内容）"
+            echo
+            echo "| 包 | 来源 | 为什么浮动 |"
+            echo "|---|---|---|"
+            echo "| linux | openipc/linux 分支 \`hisilicon-hi3516ev200\` | 跟分支不跟 SHA |"
+            echo "| toolchain-external-custom | releases/download/toolchain 里的固定文件名 tgz | 无版本号，上游可覆盖 |"
+            echo "| majestic | openipc S3 上的 \`majestic.*.master.tar.bz2\` | 文件名含 master，滚动 |"
+            echo "| majestic-webui | releases/download/dist | 固定 tag 名 dist，资产可替换 |"
+            echo "| ipctool / mavfwd / msposd / yaml-cli | GitHub \`archive/HEAD\` | 跟 HEAD |"
+            echo "| cpu-models | releases/download/v2 | tag 固定但资产可替换 |"
+            echo
+            echo "其余下载项都是带版本号的发布 tarball（如 \`busybox-1.36.1.tar.bz2\`），"
+            echo "内容在实践中稳定；本工程修改的包已固定到具体 SHA："
+            echo "\`yaml-cli-multi\`、\`wifibroadcast-ng\`。"
+            echo
+            echo "要把浮动项也固定下来，最直接的办法是：用本文件里记录的 SHA-256"
+            echo "确认下载到的内容，然后把对应的 \`*_VERSION\` 换成具体提交。"
+          } > "$OUT"
+
+          echo "=== 源码清单（前 20 行）==="
+          head -20 "$OUT"
+
+          {
+            echo "### 源码清单"
+            echo '```'
+            if [ -d work/dl ]; then
+              echo "已记录 $(find work/dl -maxdepth 2 -type f | wc -l) 个下载文件的 SHA-256"
+            else
+              echo "work/dl 不存在"
+            fi
+            echo '```'
+            echo ""
+            echo "完整清单见 artifact 里的 \`source-manifest.txt\`。"
+            echo "注意：本镜像有若干包版本浮动（linux 跟分支、majestic 滚动等），"
+            echo "所以重建不保证字节一致 —— 清单是让你能比对和回溯。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 体积报告
+        # 16MB flash 有两个独立的硬上限，任一超了上游都会让 make 失败：
+        #   1) firmware.bin(uImage+squashfs) <= 15808 KiB
+        #      = 16*1024 - 0x50000/1024 - 256
+        #   2) uImage <= 2 MiB（bootloader 只读这么多，见 CHECK_KERNEL_READ）
+        # 这里把数字摆出来，超了也给出该裁哪个包。
+        #
+        # 注意变量命名：早期版本用 f 既装 firmware.bin 又当后面 for 循环的
+        # 循环变量，循环结束后 f 变成 rootfs.ubi，于是摘要里明明构建成功却
+        # 打印「firmware.bin 未生成」。这里一律用不同前缀，且结论只算一次。
+        if: always()
+        run: |
+          set +e
+          LIMIT=15808
+          IMG=work/firmware/output/images
+          BIN="$IMG/firmware.bin"
+
+          if [ -f "$BIN" ]; then
+            kib=$(( $(stat -c %s "$BIN") / 1024 ))
+            room=$(( LIMIT - kib ))
+            if [ "$kib" -le "$LIMIT" ]; then
+              VERDICT="通过（余量 ${room} KiB）"
+            else
+              VERDICT="**超出 ${room#-} KiB**"
+            fi
+            BIN_SUMMARY="firmware.bin ${kib} KiB / 上限 ${LIMIT} KiB —— ${VERDICT}"
+          else
+            BIN_SUMMARY="firmware.bin 未生成（构建未走到打包阶段）"
+          fi
+
+          echo "=== firmware.bin ==="
+          echo "$BIN_SUMMARY"
+
+          echo
+          echo "=== images 目录实际内容 ==="
+          ls -la "$IMG" 2>/dev/null || echo "  （$IMG 不存在）"
+
+          echo
+          echo "=== 上游 CHECK_SIZE / CHECK_KERNEL_READ 的输出 ==="
+          grep -E '^- (firmware\.bin|uImage):' build.log 2>/dev/null | tail -10
+
+          echo
+          echo "=== 各分项 ==="
+          for img in uImage rootfs.squashfs rootfs.ubifs rootfs.ubi; do
+            p="$IMG/$img"
+            [ -f "$p" ] && printf '  %-28s %6s KiB\n' "$img" "$(( $(stat -c %s "$p") / 1024 ))"
+          done
+          for p in "$IMG"/firmware.bin.* "$IMG"/*-split.tgz; do
+            [ -f "$p" ] && printf '  %-28s %6s KiB\n' "${p##*/}" "$(( $(stat -c %s "$p") / 1024 ))"
+          done
+
+          {
+            echo "### 体积（${{ matrix.board }}）"
+            echo '```'
+            echo "$BIN_SUMMARY"
+            grep -E '^- (firmware\.bin|uImage):' build.log 2>/dev/null || true
+            echo '```'
+            if grep -q 'size exceeded' build.log 2>/dev/null; then
+              echo ""
+              echo "> **超出 flash。** 按这个顺序裁（先裁掉最不常用的）："
+              echo "> 1. \`BR2_PACKAGE_MAJESTIC_WEBUI\` —— 网页配置界面，SSH 仍可用"
+              echo "> 2. \`BR2_PACKAGE_RTL8733BU_OPENIPC\` —— 8812AU 已覆盖主流程"
+              echo "> 3. \`BR2_TARGET_ROOTFS_UBI\`/\`UBIFS\` —— 本板是 NOR，用不到 NAND 镜像"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 列出产物
+        if: always()
+        run: |
+          echo "=== output/images ==="
+          find work/firmware/output/images -maxdepth 1 -type f \
+               -printf '%10s  %p\n' 2>/dev/null | sort -k2 || true
+
+      - name: 生成校验和
+        if: success()
+        run: |
+          cd work/firmware/output/images
+          sha256sum ./* > SHA256SUMS || true
+          cat SHA256SUMS >> "$GITHUB_STEP_SUMMARY" || true
+
+      - name: 上传固件
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: openipc-${{ matrix.board }}-${{ github.sha }}
+          # 只上传镜像和校验和；不传 keys/（私钥不进 artifact）
+          #
+          # 注意 *.tgz 这一行：上游 REPACK_NOR_SPLIT 打出来的包叫
+          #   openipc.<soc>-nor-<variant>-split.tgz
+          # 后缀是 .tgz，不是 .tar。漏了它，带 md5sum 的安装包就不会出现在
+          # artifact 里 —— 而 sysupgrade 正需要那个包。
+          # 不上传 rootfs.ubi / rootfs.ubifs：本板是 NOR，那些是 NAND 用的
+          # 中间产物，每个好几 MB，传上去只是浪费配额。
+          path: |
+            work/firmware/output/images/*.bin
+            work/firmware/output/images/*.tgz
+            work/firmware/output/images/*.tar
+            work/firmware/output/images/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 上传构建日志（失败时也能拿到）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.board }}-${{ github.sha }}
+          path: |
+            build.log
+            source-manifest.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: 摘要
+        if: always()
+        run: |
+          {
+            echo "### OpenIPC FPV / Hi3518EV300"
+            echo ""
+            echo "- 上游: \`${upstream:-unknown}\`"
+            echo "- 结果: ${{ job.status }}"
+            echo ""
+            echo "**密钥指纹（与地面端核对）**"
+            echo '```'
+            grep -E 'fp ' keys/PUBKEYS.txt || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

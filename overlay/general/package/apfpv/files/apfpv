@@ -1,0 +1,331 @@
+#!/bin/sh
+#
+# apfpv —— 纯 AP 推流模式
+#
+# 把 USB 无线网卡做成一个普通 WiFi 热点，眼镜/手机/平板连上来，
+# 用 RTSP(H.264 原始流) 或网页取图传。**不使用 wfb-ng**，
+# 因此不需要任何密钥文件，也不需要地面端配套固件。
+#
+#   apfpv start      加载驱动并起热点 + DHCP
+#   apfpv stop       停掉热点与 DHCP
+#   apfpv restart
+#   apfpv status     看接口/客户端/取流地址
+#   apfpv detect     只打印 USB ID → 驱动名的识别结果（排障用）
+#
+# 配置在 /etc/apfpv.conf，改完 apfpv restart 即可，不必重新刷机。
+#
+set -u
+
+CONF=/etc/apfpv.conf
+VIDEO_CONF=/etc/apfpv-video.conf
+CTRL=/var/run/hostapd
+HCONF=/var/run/hostapd.conf
+DCONF=/var/run/udhcpd.conf
+LEASE=/var/run/udhcpd.leases
+
+# 编进镜像的驱动模块名；8812au 与 88XXau 是同一个驱动的两种叫法
+ALL_DRIVERS="8812au 88XXau 8733bu"
+
+log() { echo "$1" | logger -s -t apfpv; }
+
+# ---------------------------------------------------------------- 网卡识别
+#
+# lsusb 的字段位置会随 Bus 号位数漂移，所以不用 awk '{print $6}'：
+#   Bus 001 Device 002: ID 0bda:8812 Realtek Semiconductor Corp. ...
+#
+usb_ids() {
+	lsusb 2>/dev/null \
+		| sed -n 's/.*ID \([0-9a-fA-F]\{4\}:[0-9a-fA-F]\{4\}\).*/\1/p' \
+		| tr 'A-F' 'a-f'
+}
+
+driver_of_pid() {
+	case "$1" in
+		# RTL8812AU / RTL8811AU
+		0bda:8812|0bda:881a|0b05:17d2|2357:0101|2604:0012)
+			echo 8812au ;;
+
+		# RTL8733BU
+		0bda:f72b|0bda:b733)
+			echo 8733bu ;;
+	esac
+}
+
+# 只在 $( ) 里用，stdout 必须只有驱动名，日志一律走 stderr
+detect_driver() {
+	for id in $(usb_ids); do
+		d=$(driver_of_pid "$id")
+		if [ -n "$d" ]; then
+			echo "$d"
+			return 0
+		fi
+	done
+	return 1
+}
+
+pick_wdev() {
+	for n in /sys/class/net/wlan*; do
+		[ -e "$n" ] || continue
+		WDEV=${n##*/}
+		return 0
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------- 配置
+load_conf() {
+	# 默认值：5.8GHz（与 FPV 习惯一致），手机若收不到可改 2.4GHz
+	SSID="OpenIPC-AP"
+	PASSWORD="openipc12345"
+	CHANNEL=161
+	HW_MODE=a
+	WIDTH=20
+	AP_IP=192.168.4.1
+	AP_MASK=255.255.255.0
+
+	if [ -e "$CONF" ]; then
+		while IFS='=' read -r k v; do
+			case "$k" in
+				''|\#*) continue ;;
+			esac
+			k=$(echo "$k" | tr -d ' \t')
+			v=$(echo "$v" | tr -d ' \t\r')
+			case "$k" in
+				SSID|PASSWORD|CHANNEL|HW_MODE|WIDTH|AP_IP|AP_MASK)
+					# 只接受上面这几个键，避免把任意变量塞进环境
+					eval "$k=\$v"
+					;;
+			esac
+		done < "$CONF"
+	fi
+
+	# 5.8GHz 必须 hw_mode=a；2.4GHz 必须 g。两者不一致时以信道为准并纠正，
+	# 否则 hostapd 会在启动时报 "channel not valid for hw_mode" 然后退出。
+	if [ "$CHANNEL" -ge 36 ] 2>/dev/null; then
+		[ "$HW_MODE" = "a" ] || { HW_MODE=a; log "信道 $CHANNEL 属 5GHz，hw_mode 已纠正为 a"; }
+	else
+		[ "$HW_MODE" = "g" ] || { HW_MODE=g; log "信道 $CHANNEL 属 2.4GHz，hw_mode 已纠正为 g"; }
+	fi
+}
+
+# ---------------------------------------------------------------- 视频剖面
+#
+# 只在首次启动写一次（用 /etc/system.ok 做标记），之后尊重你手改的值。
+#
+# 这一步不能省：上游给 .isp.sensorConfig 拼的是 <sensor>_<family>.bin，
+# 那是 SigmaStar 的命名；海思这边真名是 jxf23_i2c_1080p.ini，
+# 不显式写就会指向一个不存在的文件，摄像头起不来。
+#
+video_defaults() {
+	[ -e /etc/system.ok ] && return 0
+
+	VIDEO_SIZE=1920x1080
+	VIDEO_FPS=30
+	VIDEO_CODEC=h264
+	VIDEO_BITRATE=8000
+	VIDEO_RCMODE=cbr
+	SENSOR_INI=/etc/sensors/jxf23_i2c_1080p.ini
+
+	if [ -e "$VIDEO_CONF" ]; then
+		while IFS='=' read -r k v; do
+			case "$k" in
+				''|\#*) continue ;;
+			esac
+			k=$(echo "$k" | tr -d ' \t')
+			v=$(echo "$v" | tr -d ' \t\r')
+			case "$k" in
+				VIDEO_SIZE|VIDEO_FPS|VIDEO_CODEC|VIDEO_BITRATE|VIDEO_RCMODE|SENSOR_INI)
+					eval "$k=\$v"
+					;;
+			esac
+		done < "$VIDEO_CONF"
+	fi
+
+	if [ -f "$SENSOR_INI" ]; then
+		cli -s .isp.sensorConfig "$SENSOR_INI" 2>/dev/null
+	else
+		log "警告：$SENSOR_INI 不存在，交给 majestic 自动探测"
+	fi
+	cli -s .isp.exposure 16 2>/dev/null
+	cli -s .video0.size "$VIDEO_SIZE" 2>/dev/null
+	cli -s .video0.fps "$VIDEO_FPS" 2>/dev/null
+	cli -s .video0.codec "$VIDEO_CODEC" 2>/dev/null
+	cli -s .video0.bitrate "$VIDEO_BITRATE" 2>/dev/null
+	cli -s .video0.rcMode "$VIDEO_RCMODE" 2>/dev/null
+	cli -s .video0.noiseLevel 0 2>/dev/null
+
+	touch /etc/system.ok
+	killall -1 majestic 2>/dev/null
+	log "视频剖面：$VIDEO_SIZE@${VIDEO_FPS} $VIDEO_CODEC ${VIDEO_BITRATE}kbps $VIDEO_RCMODE"
+}
+
+# ---------------------------------------------------------------- 生成配置
+gen_hostapd() {
+	{
+		echo "interface=$WDEV"
+		# nl80211 对 rtw 驱动是首选；若报 driver 不支持，
+		# 把下面这行改成 driver=rtw（rtw-hostapd 编了该后端）
+		echo "driver=nl80211"
+		echo "ssid=$SSID"
+		echo "hw_mode=$HW_MODE"
+		echo "channel=$CHANNEL"
+		echo "country_code=CN"
+		echo "ieee80211d=1"
+		echo "ieee80211n=1"
+		# 11ac 只在 5GHz 下开
+		[ "$HW_MODE" = "a" ] && echo "ieee80211ac=1"
+		echo "wmm_enabled=1"
+		echo "ctrl_interface=$CTRL"
+		echo "ctrl_interface_group=0"
+		if [ -n "$PASSWORD" ]; then
+			echo "wpa=2"
+			echo "wpa_key_mgmt=WPA-PSK"
+			echo "wpa_pairwise=CCMP"
+			echo "rsn_pairwise=CCMP"
+			echo "wpa_passphrase=$PASSWORD"
+		fi
+	} > "$HCONF"
+}
+
+gen_udhcpd() {
+	# 租约池取 AP 地址的最后一段：192.168.4.10 - 192.168.4.100
+	base=${AP_IP%.*}
+	{
+		echo "start $base.10"
+		echo "end $base.100"
+		echo "interface $WDEV"
+		echo "lease_file $LEASE"
+		echo "pidfile /var/run/udhcpd.pid"
+		echo "option subnet $AP_MASK"
+		echo "option router $AP_IP"
+		echo "option dns $AP_IP"
+		echo "option lease 3600"
+	} > "$DCONF"
+}
+
+# ---------------------------------------------------------------- 动作
+do_start() {
+	load_conf
+	video_defaults
+
+	driver=$(detect_driver) || {
+		log "未识别到受支持的 USB 无线网卡；lsusb 里一条设备都没有就说明 USB 主机口没起来"
+		exit 1
+	}
+
+	# 先全卸再只装匹配的那个：mdev 会按 modalias 抢先绑上不匹配的模块
+	for m in $ALL_DRIVERS; do
+		modprobe -r "$m" 2>/dev/null
+	done
+	sleep 1
+
+	log "Loading $driver"
+	if ! modprobe "$driver" MaxTxBufLen=32 2>/dev/null; then
+		if ! modprobe "$driver"; then
+			log "modprobe $driver 失败"
+			exit 1
+		fi
+	fi
+
+	i=0
+	while [ $i -lt 15 ]; do
+		pick_wdev && break
+		i=$((i + 1))
+		sleep 1
+	done
+	if ! pick_wdev; then
+		log "驱动已加载但没出现 wlan 接口"
+		exit 1
+	fi
+	log "无线接口 $WDEV"
+
+	ifconfig "$WDEV" "$AP_IP" netmask "$AP_MASK" up || {
+		log "ifconfig $WDEV $AP_IP 失败"
+		exit 1
+	}
+
+	mkdir -p "$CTRL"
+	gen_hostapd
+	gen_udhcpd
+
+	if ! hostapd -B "$HCONF"; then
+		log "hostapd 启动失败，看 dmesg 与 hostapd -d $HCONF 的报错"
+		exit 1
+	fi
+	udhcpd -S "$DCONF" || log "udhcpd 启动失败（热点仍在，客户端需手动配 IP）"
+
+	log "热点已启动：SSID=$SSID 信道=${CHANNEL}(${HW_MODE}) 本机 $AP_IP"
+	log "取流：rtsp://$AP_IP:554/   网页：http://$AP_IP/"
+}
+
+do_stop() {
+	killall hostapd 2>/dev/null
+	killall udhcpd 2>/dev/null
+	sleep 1
+	if pick_wdev; then
+		ifconfig "$WDEV" down 2>/dev/null
+		# 释放热点地址，否则下次 start 会带着旧地址
+		ifconfig "$WDEV" 0.0.0.0 2>/dev/null
+	fi
+	rm -rf "$CTRL"
+	rm -f "$HCONF" "$DCONF" "$LEASE"
+	log "热点已停止"
+}
+
+do_status() {
+	load_conf
+	echo "=== 配置 ==="
+	echo "  SSID     : $SSID"
+	echo "  PASSWORD : $([ -n "$PASSWORD" ] && echo '已设置（WPA2）' || echo '空 —— 开放网络')"
+	echo "  信道     : $CHANNEL (hw_mode=$HW_MODE, ${WIDTH}MHz)"
+	echo "  本机地址 : $AP_IP/$AP_MASK"
+	echo
+	echo "=== 无线接口 ==="
+	iw dev 2>/dev/null | sed 's/^/  /' || echo "  （没有 wlan 接口）"
+	echo
+	echo "=== 进程 ==="
+	for p in hostapd udhcpd; do
+		if [ -n "$(pidof $p)" ]; then echo "  $p 在跑"; else echo "  $p 没跑"; fi
+	done
+	echo
+	echo "=== 已连接的客户端 ==="
+	if pick_wdev; then
+		iw dev "$WDEV" station dump 2>/dev/null | grep -E '^Station|signal:' | sed 's/^/  /' \
+			|| echo "  （暂无）"
+	fi
+	echo
+	echo "=== 取流地址（给连上来的设备） ==="
+	echo "  RTSP : rtsp://$AP_IP:554/"
+	echo "  网页 : http://$AP_IP/"
+	echo "  ONVIF: $AP_IP（客户端自动发现）"
+}
+
+case "${1:-}" in
+	start)   do_start ;;
+	stop)    do_stop ;;
+	restart) do_stop; sleep 1; do_start ;;
+	reset)
+		# 恢复出厂：把 /etc 上的配置换回 squashfs 里的原件，再重新写一次视频剖面。
+		# 必须先 load_conf —— 它负责把 SSID/信道等变量填好，
+		# 否则后面的日志会全是空值（FPV 那份脚本在这里踩过坑）。
+		do_stop
+		load_conf
+		cp -f /rom/etc/apfpv.conf "$CONF" 2>/dev/null
+		cp -f /rom/etc/apfpv-video.conf "$VIDEO_CONF" 2>/dev/null
+		rm -f /etc/system.ok
+		log "已恢复出厂配置，重启后生效（reboot）"
+		;;
+	status)  do_status ;;
+	detect)
+		for id in $(usb_ids); do
+			d=$(driver_of_pid "$id")
+			echo "$id -> ${d:-未知}"
+		done
+		if [ -z "$(usb_ids)" ]; then
+			echo "（lsusb 没有任何 USB 设备 —— 先确认 USB 主机口是否枚举）"
+		fi
+		;;
+	*)
+		echo "Usage: $0 {start|stop|restart|status|detect}" >&2
+		exit 1 ;;
+esac

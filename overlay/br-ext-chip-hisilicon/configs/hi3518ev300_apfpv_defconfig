@@ -1,0 +1,134 @@
+# ============================================================================
+# OpenIPC AP 推流模式（纯 AP，不用 wfb-ng）
+#   SoC      : HiSilicon Hi3518EV300  (family hi3516ev200, ARM Cortex-A7)
+#   Sensor   : F23  ->  /etc/sensors/jxf23_i2c_1080p.ini
+#   Flash    : 16 MB SPI NOR (split layout, firmware @ 0x50000)
+#   Wireless : RTL8812AU, RTL8733BU —— 做成热点，客户端直接取 RTSP
+#
+# 与 hi3518ev300_fpv_wfbng_defconfig 的区别：
+#   - VARIANT="apfpv"（产物名 openipc.hi3518ev300-nor-apfpv-split.tgz）
+#   - 不含 wifibroadcast-ng，因此没有任何密钥文件、不需要地面端配套固件
+#   - 改为 hostapd 热点 + BusyBox udhcpd 分配地址
+#   - 保留 majestic（编码 + RTSP 服务端 + 网页）
+#
+# 基线同样取自上游 hi3518ev300_ultimate_defconfig；工具链 / 内核 / 分区
+# 这几行必须与上游逐字一致，否则 Buildroot 取不到 $(OPENIPC_TOOLCHAIN)
+# 与 $(OPENIPC_KERNEL) 的下载地址。
+# ============================================================================
+
+# Architecture
+BR2_arm=y
+BR2_cortex_a7=y
+BR2_ARM_EABI=y
+BR2_ARM_FPU_NEON_VFPV4=y
+BR2_ARM_INSTRUCTIONS_THUMB2=y
+
+# Toolchain
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_DOWNLOAD=y
+BR2_TOOLCHAIN_EXTERNAL_URL="https://github.com/openipc/firmware/releases/download/$(OPENIPC_TOOLCHAIN).tgz"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-openipc-linux-musleabi"
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_9=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_MUSL=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+
+# Kernel (Linux 4.9.37)
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_TARBALL=y
+BR2_LINUX_KERNEL_CUSTOM_TARBALL_LOCATION="https://github.com/openipc/linux/archive/$(OPENIPC_KERNEL).tar.gz"
+BR2_LINUX_KERNEL_USE_CUSTOM_CONFIG=y
+BR2_LINUX_KERNEL_CUSTOM_CONFIG_FILE="$(EXTERNAL_VENDOR)/board/$(OPENIPC_SOC_FAMILY)/hi3518ev300.generic.config"
+BR2_LINUX_KERNEL_UIMAGE=y
+BR2_LINUX_KERNEL_XZ=y
+
+# Filesystem
+BR2_PACKAGE_BUSYBOX_CONFIG="$(BR2_EXTERNAL)/package/busybox/busybox.config"
+BR2_PACKAGE_UBOOT_TOOLS=y
+# BR2_PACKAGE_IFUPDOWN_SCRIPTS is not set
+BR2_PACKAGE_WIRELESS_TOOLS=y
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_CLI=y
+BR2_PACKAGE_WPA_SUPPLICANT_PASSPHRASE=y
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_SQUASHFS=y
+BR2_TARGET_ROOTFS_SQUASHFS4_XZ=y
+BR2_TARGET_ROOTFS_UBI=y
+BR2_TARGET_ROOTFS_UBI_SUBSIZE=2048
+BR2_TARGET_ROOTFS_UBI_USE_CUSTOM_CONFIG=y
+BR2_TARGET_ROOTFS_UBI_CUSTOM_CONFIG_FILE="$(EXTERNAL_VENDOR)/board/$(OPENIPC_SOC_FAMILY)/ubinize-nand.cfg"
+BR2_TARGET_ROOTFS_UBIFS_LEBSIZE=0x1f000
+
+# OpenIPC
+BR2_OPENIPC_SOC_VENDOR="hisilicon"
+BR2_OPENIPC_SOC_MODEL="hi3518ev300"
+BR2_OPENIPC_SOC_FAMILY="hi3516ev200"
+BR2_OPENIPC_SNS_MODEL="f23"
+# 变体名取 "apfpv"：
+#   - 它含 "fpv" 子串，rtl8733bu-openipc.mk 用 $(findstring fpv,...) 匹配，
+#     所以仍会选上游验证过的 rtl8733bu_fpv 分支（这点很关键）；
+#   - 但它不是整词 fpv/wfbng，因此 hisilicon-opensdk.mk 与
+#     majestic-webui.mk 里的 $(filter fpv wfbng,...) 不会命中 ——
+#     后果是：不装 IMX307/IMX335 的高帧率传感器库（F23 本来用不上），
+#     网页用 STANDARD 页面而不是 FPV 页面（纯 AP 场景更合适）。
+#   这两条都是主动选择，不是意外。
+BR2_OPENIPC_VARIANT="apfpv"
+BR2_OPENIPC_FLASH_SIZE="16"
+BR2_OPENIPC_MAJESTIC="ultimate"
+
+# ---- 基础工具 -------------------------------------------------------------
+BR2_PACKAGE_CPU_MODELS=y
+# 沿用上游默认：root 空密码，dropbear 用 -B 启动（允许空密码登录）。
+# 刷完机请立刻 `passwd root`。热点的 WPA2 密码只保护 WiFi，不保护 SSH。
+BR2_PACKAGE_DROPBEAR_OPENIPC=y
+BR2_PACKAGE_HISILICON_OPENSDK=y
+BR2_PACKAGE_HISILICON_OSDRV_HI3516EV200=y
+BR2_PACKAGE_IPCTOOL=y
+BR2_PACKAGE_LINUX_FIRMWARE_OPENIPC=y
+
+# ---- 视频 / 取流 -----------------------------------------------------------
+# majestic 负责 H.264 编码 + RTSP 服务端(554) + 网页(80) + ONVIF
+BR2_PACKAGE_MAJESTIC=y
+BR2_PACKAGE_MAJESTIC_FONTS=y
+BR2_PACKAGE_MAJESTIC_WEBUI=y
+# `cli` 脚本（general/overlay/usr/sbin/cli）依赖 yaml-cli 读写 majestic.yaml
+BR2_PACKAGE_YAML_CLI=y
+
+# ---- 热点 ----------------------------------------------------------------
+# apfpv 会 select RTW_HOSTAPD 及其 nl80211 / rtw 后端，这里显式写出来，
+# 一是让交付物清单一眼可见，二是方便你关掉不需要的后端省空间。
+# WPA2-PSK 走 hostapd 的 internal TLS：只要不选 BR2_PACKAGE_LIBOPENSSL，
+# rtw-hostapd 就自动用 CONFIG_TLS=internal，省掉约 1.3 MB 的 OpenSSL。
+BR2_PACKAGE_APFPV=y
+BR2_PACKAGE_RTW_HOSTAPD=y
+BR2_PACKAGE_RTW_HOSTAPD_DRIVER_NL80211=y
+BR2_PACKAGE_RTW_HOSTAPD_DRIVER_RTW=y
+
+# ---- USB Wi-Fi 驱动 --------------------------------------------------------
+# 与 FPV 那份一致：只保留两个有 4.9 依据的卡，全部编成模块，
+# 运行时由 /usr/bin/apfpv 按 USB VID:PID 只加载匹配的那一个。
+BR2_PACKAGE_RTL8812AU_OPENIPC=y
+BR2_PACKAGE_RTL8733BU_OPENIPC=y
+# RTL8814AU / RTL8812CU 不编入，原因见 docs/网卡与传感器兼容性.md
+
+# ---- 已裁掉（16MB flash，AP 模式用不到）-----------------------------------
+# mosquitto / zerotier / wireguard / uacme / vtund / lame / quirc /
+# divinus / rtl8188fu / rtl8189fs / iptables
+# BR2_PACKAGE_MOSQUITTO is not set
+# BR2_PACKAGE_ZEROTIER_ONE is not set
+# BR2_PACKAGE_WIREGUARD_TOOLS is not set
+# BR2_PACKAGE_WIREGUARD_LINUX_COMPAT is not set
+# BR2_PACKAGE_UACME_OPENIPC is not set
+# BR2_PACKAGE_VTUND_OPENIPC is not set
+# BR2_PACKAGE_LAME_OPENIPC is not set
+# BR2_PACKAGE_QUIRC_OPENIPC is not set
+# BR2_PACKAGE_DIVINUS is not set
+# BR2_PACKAGE_RTL8188FU_OPENIPC is not set
+# BR2_PACKAGE_RTL8189FS_OPENIPC is not set
+# BR2_PACKAGE_IPTABLES is not set
+#
+# 注意：opus / libogg 同样裁不掉 —— majestic.mk 里 MAJESTIC_DEPENDENCIES
+# 直接声明了这两个包，kconfig 符号拦不住。详见 docs/网卡与传感器兼容性.md §6。
+# BR2_PACKAGE_OPUS_OPENIPC is not set
+# BR2_PACKAGE_LIBOGG_OPENIPC is not set
+
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_GENERAL_PATH)/scripts/post-image-split.sh"

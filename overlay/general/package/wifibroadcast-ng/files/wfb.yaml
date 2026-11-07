@@ -1,0 +1,45 @@
+# wfb-ng 链路配置 —— 空中端 (drone / TX)
+#
+# 取值来源：用户指定 5.8GHz / 20MHz / MCS1 / FEC 8:12
+#
+# 地面端 (gs.key 那一侧) 必须与此处的 channel / width / mcs_index /
+# fec_k / fec_n / link_id 完全一致，否则收不到图。
+#
+# 运行时读这份文件的程序：
+#   /usr/bin/wifibroadcast  (S98wifibroadcast 调起)
+# 改完执行：  wifibroadcast stop ; wifibroadcast start
+wireless:
+  # 20 = 8812au 家族按 dBm*100 换算后就是 20 dBm。
+  # RTL8733BU 走另一条换算分支(txpower*50)，同为 20 dBm。
+  txpower: 20
+  # 161 = 5805 MHz，5.8G 频段。常用替代：149(5745) 153(5765) 157(5785) 165(5825)
+  channel: 161
+  # 20MHz。改成 40 会启用 HT40+，吞吐更高但抗干扰更差
+  width: 20
+  # 注入帧的 MTU。3994 与上游 OpenIPC FPV 的运行时取值一致
+  # （上游打包的 yaml 写 1500，但 video_settings 里会 cli -s 改成 3994）。
+  # 本脚本会在设完之后回读 /sys/class/net/<dev>/mtu，驱动不接受时自动按
+  # 真实值反推 rtsp.naluSize，不会出现两者错配。
+  mlink: 3994
+  # 固定 MCS，不做自适应。要用自适应链路就填 alink 并安装 adaptive-link 包
+  link_control: none
+broadcast:
+  # MCS1 = QPSK 1/2，1 条空间流。MCS 越高越吃信噪比
+  mcs_index: 1
+  tun_index: 1
+  fec_k: 8
+  fec_n: 12
+  # 这里写 0/0 是「打包默认值」，与上游打包的 wfb.yaml 相同。
+  # 首次启动时脚本会按识别到的卡种**改写这两个值**（见 video_settings）：
+  #   8812au  支持 STBC 与 LDPC  -> 改成 1 / 1，远距更稳
+  #   8733bu                    1T1R，无 STBC      -> 保持 0 / 0
+  # STBC/LDPC 只影响发送端编码，地面端 wfb_rx 自动识别，无需同步修改。
+  stbc: 0
+  ldpc: 0
+  # 链路 ID —— 必须与地面端一致，否则 wfb 层直接丢弃
+  link_id: 7669206
+telemetry:
+  router: msposd
+  # Hi3518EV300 上接飞控的串口。板上丝印 UART2 若实际是 ttyS1，改这里
+  serial: ttyS2
+  osd_fps: 20

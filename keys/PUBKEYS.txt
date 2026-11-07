@@ -1,0 +1,10 @@
+# wfb-ng 密钥指纹（仅公钥，可安全分享/用于核对）
+# 私钥不会出现在本文件中
+
+drone pubkey : a718a2187860dff18e4a0343d5f208029dfe59afb96bd1ca5a5abc63261cab1d
+drone fp     : f9dc:cdaa:7450:2ca8
+gs    pubkey : edb839fd353696b39ba233954311dc0598ef239fa2b8f7f1e62bfcfc00213048
+gs    fp     : 1506:2d31:01ae:86bc
+
+session key  : 0b53c4a0b5eb4ddc3d1c7f4a59f648de50526540af64a9ad21ee9f564a65796f
+（session key 由 wfb_tx 每会话重新协商，此处仅作一致性证明）
